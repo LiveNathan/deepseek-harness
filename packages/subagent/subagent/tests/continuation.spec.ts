@@ -13,7 +13,7 @@ import SessionProjectionRegistry from '@deepseek-ai/dsh-session-projection'
 import * as SubagentSpawn from '@deepseek-ai/dsh-subagent-spawn-in-process'
 import * as SubagentFork from '@deepseek-ai/dsh-subagent-fork-in-process'
 import type { ContentBlock, GenerateOptions, MessageId, StreamChunk } from '@deepseek-ai/dsh-llm'
-import { ToolCallId, createUserMessage, LlmAdapter, ReasoningEffortId } from '@deepseek-ai/dsh-llm'
+import { ToolCallId, boundContextSummary, createUserMessage, LlmAdapter, ReasoningEffortId } from '@deepseek-ai/dsh-llm'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import InvariantRegistry from '@deepseek-ai/dsh-invariants'
 import { MockAdapter, maxTokensResponse, textResponse, toolCallResponse } from '../../../core/agent-loop/tests/mock-adapter.ts'
@@ -914,6 +914,52 @@ describe('continuable child ownership', () => {
     await waitNoActivation(ctx, started.childId)
     // The top-level parent remains independently registered after its child settles.
     expect(ctx.agents.get(parent.id)).toBe(parent)
+  })
+
+  it('tells the parent once when a child parks waiting on its descendants', async () => {
+    const releaseGrandchild = Promise.withResolvers<undefined>()
+    const adapter = new GatedAdapter([
+      // The child delegates, then finishes its own turn while the grandchild runs.
+      { chunks: textResponse('child done') },
+      { chunks: textResponse('grandchild'), gate: releaseGrandchild.promise },
+      { chunks: textResponse('woken') },
+    ])
+    const { ctx, parent } = await setupWith(adapter)
+    const started = await ctx.subagents.startContinuable(startSpec(parent))
+    const child = await vi.waitFor(() => {
+      const found = ctx.agents.get(started.childId)
+      expect(found).toBeDefined()
+      return found!
+    })
+    const grandchild = await ctx.subagents.startContinuable(startSpec(child))
+    await vi.waitFor(() => {
+      expect(child.status).toBe('idle')
+      expect(ctx.agents.get(started.childId)).toBe(child)
+    }, { timeout: 5_000 })
+
+    // The child is now waiting on its grandchild: the parent is told once.
+    await vi.waitFor(() => { expect(waitingNotices(parent)).toHaveLength(1) })
+    const expected = `Background subagent ${started.childId} is waiting on its subagents `
+      + `(${grandchild.childId}) and will report when they settle.`
+    const notice = waitingNotices(parent)[0]!
+    expect(notice.sender).toBe(started.childId)
+    expect(notice.text).toBe(expected)
+    // The collapsed-row account bounds the child list to the notice summary cap.
+    expect(notice.summary).toBe(boundContextSummary(expected))
+
+    // A waking delivery returns the child to running, and it parks again: the
+    // second park is not re-reported.
+    await queuePrompt(ctx, parent, started.childId, message('while waiting'))
+    await vi.waitFor(() => {
+      expect(adapter.requests.filter(request => request.sessionId === started.childId)).toHaveLength(2)
+    })
+    await vi.waitFor(() => { expect(child.status).toBe('idle') }, { timeout: 5_000 })
+    expect(waitingNotices(parent)).toHaveLength(1)
+
+    releaseGrandchild.resolve(undefined)
+    await waitNoActivation(ctx, grandchild.childId)
+    await waitNoActivation(ctx, started.childId)
+    expect(waitingNotices(parent)).toHaveLength(1)
   })
 })
 
@@ -1837,6 +1883,19 @@ function settlementNotices(agent: Agent): { sender: string; text: string; summar
   const logged = agent.session.snapshotEvents().flatMap(event => event.type === 'user/message' ? [event.data] : [])
   return [...logged, ...agent.inbox.nextStep, ...agent.inbox.nextTurn].flatMap((message) => {
     if (message.source.kind !== 'subagent-settled') return []
+    return [{
+      sender: message.source.senderSessionId,
+      summary: message.source.summary,
+      text: message.content.flatMap(block => block.type === 'text' ? [block.text] : []).join('\n'),
+    }]
+  })
+}
+
+/** Every waiting (park) notice this agent received, in order, as flat text. */
+function waitingNotices(agent: Agent): { sender: string; text: string; summary: string }[] {
+  const logged = agent.session.snapshotEvents().flatMap(event => event.type === 'user/message' ? [event.data] : [])
+  return [...logged, ...agent.inbox.nextStep, ...agent.inbox.nextTurn].flatMap((message) => {
+    if (message.source.kind !== 'subagent-waiting') return []
     return [{
       sender: message.source.senderSessionId,
       summary: message.source.summary,

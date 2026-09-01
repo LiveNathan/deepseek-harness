@@ -81,10 +81,27 @@ export interface SubagentSettledMessageSource {
   readonly senderSessionId: SessionId
 }
 
+/**
+ * Durable attribution for the runtime's account of a continuable child parking
+ * in `waiting`: its turn ended while descendants it owns are still running.
+ * A different kind from {@link SubagentSettledMessageSource} so a consumer can
+ * tell "still working through its children" from "finished" without polling.
+ */
+export interface SubagentWaitingMessageSource {
+  readonly kind: 'subagent-waiting'
+  /** A runtime account shown without expanding the row (`notice` context form). */
+  readonly form: 'notice'
+  /** One-line account of what the child is waiting on. */
+  readonly summary: string
+  /** Session id of the child that parked. */
+  readonly senderSessionId: SessionId
+}
+
 declare module '@deepseek-ai/dsh-llm' {
   interface MessageSourceMap {
     'agent-message': AgentMessageSource
     'subagent-settled': SubagentSettledMessageSource
+    'subagent-waiting': SubagentWaitingMessageSource
   }
 }
 
@@ -224,6 +241,12 @@ interface Activation {
    * not exist, so its teardown owes the parent no settlement account.
    */
   announced: boolean
+  /**
+   * Whether this Activation already told the parent it parked in `waiting`.
+   * Set on the first running→waiting observation and never cleared, so a child
+   * that wakes and parks again is not re-reported on every ownership wake.
+   */
+  waitingNotified: boolean
   /** Renewed whenever a settlement watcher must re-observe quiescence. */
   poke: PromiseWithResolvers<void>
 }
@@ -338,9 +361,21 @@ function settlementSummary(childId: SessionId, stopReason: SubagentResult['stopR
   }
 }
 
+/**
+ * One line telling a parent that a background child is parked waiting on the
+ * descendants it spawned, in the parent's own task vocabulary.
+ * @param childId - the durable child the parent knows by id.
+ * @param children - the owned child ids this child is still waiting on.
+ * @returns the model-facing line of the waiting notice.
+ */
+function parkSummary(childId: SessionId, children: readonly SessionId[]): string {
+  const subject = `Background subagent ${childId}`
+  return `${subject} is waiting on its subagents (${children.join(', ')}) and will report when they settle.`
+}
+
 /** Whether one settlement attempt opened the disposal transaction. */
 type SettlementAttempt =
-  | { readonly settling: false }
+  | { readonly settling: false; readonly state: ActivationState | undefined }
   | { readonly settling: true; readonly done: Promise<void> }
 
 /** Serialize each durable child's delivery, release, and disposal. */
@@ -1169,6 +1204,7 @@ export class SubagentContinuationManager {
       disposal: undefined,
       accepted: new Set(),
       announced: false,
+      waitingNotified: false,
       poke: Promise.withResolvers<void>(),
     }
     // After transfer, any failure must dispose the created handle, remove the
@@ -1377,8 +1413,12 @@ export class SubagentContinuationManager {
         // Deciding outside the lock would let a delivery observe a not-yet
         // resident handle that this watcher is already about to tear down.
         const settling = await this.locks.run<SettlementAttempt>(activation.childId, () => {
-          if (disposalOf(activation) !== undefined || this.stateOf(activation) !== 'settled') {
-            return Promise.resolve({ settling: false })
+          if (disposalOf(activation) !== undefined) {
+            return Promise.resolve({ settling: false, state: undefined })
+          }
+          const state = this.stateOf(activation)
+          if (state !== 'settled') {
+            return Promise.resolve({ settling: false, state })
           }
           // `dispose()` assigns its memoized transaction synchronously, so
           // admission is closed before this critical section releases.
@@ -1387,6 +1427,7 @@ export class SubagentContinuationManager {
         if (!settling.settling) {
           // Still running, or waiting on descendants: re-observe after the next
           // accepted message or ownership release.
+          if (settling.state === 'waiting') this.notifyParked(activation)
           if (activation.handle.agent.status !== 'running') await poked
           continue
         }
@@ -1521,37 +1562,77 @@ export class SubagentContinuationManager {
    * need it — a token ceiling, a model failure, cancellation, teardown — are
    * exactly the ones where the child never got to choose. A materialization
    * rolled back before its first acceptance stays silent, since the caller was
-   * told that child was not established. A parent that is no longer live is not
-   * an error; the child's own Session remains the durable record either way.
-   * A parent whose own lineage is already closing receives the notice without a
-   * wake, because teardown is not a reason to start a turn.
-   *
-   * Never blocks disposal. A delivery failure is logged and dropped, because
-   * retaining a child to retry a notice would pin its whole ancestry in
-   * `waiting` forever.
+   * told that child was not established.
    * @param activation - the settling Activation, still owned by its parent.
    * @param terminal - how this epoch ended, as the terminal edge will report it.
    */
   private notifySettlement(activation: Activation, terminal: ActivationTerminal): void {
     if (!activation.announced) return
+    const summary = settlementSummary(activation.childId, terminal.stopReason)
+    const message = createUserMessage({
+      content: [
+        { type: 'text' as const, text: summary },
+        ...terminal.output === undefined
+          ? [{ type: 'text' as const, text: 'It left no closing message.' }]
+          : [{ type: 'text' as const, text: 'Its closing message:' }, ...terminal.output],
+      ],
+      source: {
+        kind: 'subagent-settled' as const,
+        form: 'notice' as const,
+        summary: boundContextSummary(summary),
+        senderSessionId: activation.childId,
+      },
+    })
+    this.deliverParentNotice(activation, message, 'settlement notice')
+  }
+
+  /**
+   * Tell the durable direct parent that this child's turn ended while the
+   * descendants it spawned are still running. Reported once per Activation:
+   * the first running→waiting observation is the signal the parent needs to
+   * distinguish "working through its children" from "stalled", and a later
+   * park after a waking turn adds no new information. Reached only after the
+   * child ran a turn, so no `announced` guard is needed.
+   * @param activation - the Activation that just entered `waiting`.
+   */
+  private notifyParked(activation: Activation): void {
+    if (activation.waitingNotified) return
+    activation.waitingNotified = true
+    const summary = parkSummary(activation.childId, [...activation.ownedChildren])
+    const message = createUserMessage({
+      content: [{ type: 'text' as const, text: summary }],
+      source: {
+        kind: 'subagent-waiting' as const,
+        form: 'notice' as const,
+        summary: boundContextSummary(summary),
+        senderSessionId: activation.childId,
+      },
+    })
+    this.deliverParentNotice(activation, message, 'waiting notice')
+  }
+
+  /**
+   * Deliver one runtime account to the durable direct parent. A parent that is
+   * no longer live is not an error; the child's own Session remains the durable
+   * record either way. A parent whose own lineage is already closing receives
+   * the notice without a wake, because teardown is not a reason to start a
+   * turn.
+   *
+   * Never blocks disposal. A delivery failure is logged and dropped, because
+   * retaining a child to retry a notice would pin its whole ancestry in
+   * `waiting` forever.
+   * @param activation - the child whose parent receives the account.
+   * @param message - the built user-role notice to deliver.
+   * @param label - the notice noun used in the non-delivery warning.
+   */
+  private deliverParentNotice(
+    activation: Activation,
+    message: ReturnType<typeof createUserMessage>,
+    label: string,
+  ): void {
     try {
       const parent = this.ctx.agents.get(activation.parentSession)
       if (parent === undefined) return
-      const summary = settlementSummary(activation.childId, terminal.stopReason)
-      const message = createUserMessage({
-        content: [
-          { type: 'text' as const, text: summary },
-          ...terminal.output === undefined
-            ? [{ type: 'text' as const, text: 'It left no closing message.' }]
-            : [{ type: 'text' as const, text: 'Its closing message:' }, ...terminal.output],
-        ],
-        source: {
-          kind: 'subagent-settled' as const,
-          form: 'notice' as const,
-          summary: boundContextSummary(summary),
-          senderSessionId: activation.childId,
-        },
-      })
       // A parent whose own teardown already began must not be woken. Waking is
       // not a queue operation: `followup()` on a quiescent Agent starts a turn,
       // and `cancel()` does not arm against a later one, so a notice arriving
@@ -1577,7 +1658,7 @@ export class SubagentContinuationManager {
       })
     } catch (error: unknown) {
       this.ctx.logger.warn(
-        `subagent "${activation.childId}" settlement notice was not delivered to its parent: `
+        `subagent "${activation.childId}" ${label} was not delivered to its parent: `
         + errorChain(error),
       )
     }
