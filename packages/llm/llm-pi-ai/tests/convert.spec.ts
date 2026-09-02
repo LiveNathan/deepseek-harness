@@ -836,6 +836,62 @@ describe('mapStopReason / mapUsage', () => {
     }))).toMatchObject({ kind: 'error', failure: { code: 'PI_AI_ERROR' } })
   })
 
+  it('classifies a quota error that names a retry delay as a transient RATE_LIMIT and honors the delay', () => {
+    // Gemini's per-minute input-token quota: RESOURCE_EXHAUSTED with a
+    // `RetryInfo.retryDelay` detail. It is transient (retryable) — not the
+    // terminal account-quota/balance exhaustion the QUOTA code reserves.
+    const errorMessage = [
+      'You exceeded your current quota, please check your plan and billing details.',
+      'status: RESOURCE_EXHAUSTED',
+      '"retryDelay": "10s"',
+      'code: 429',
+    ].join(' ')
+    expect(mapStopReason(assistant({ stopReason: 'error', errorMessage }))).toEqual({
+      kind: 'error',
+      failure: { message: errorMessage, code: 'RATE_LIMIT', providerRetryAfterMs: 10_000 },
+    })
+  })
+
+  it('honors the human "Please retry in Ns" wording when RetryInfo is absent', () => {
+    const errorMessage = 'HTTP 429 rate limit: Please retry in 10.670677114s.'
+    expect(mapStopReason(assistant({ stopReason: 'error', errorMessage })))
+      .toMatchObject({ kind: 'error', failure: { code: 'RATE_LIMIT', providerRetryAfterMs: 10_671 } })
+  })
+
+  it('keeps a terminal quota error (no retry hint) as QUOTA', () => {
+    const errorMessage = 'Insufficient quota: your account balance is exhausted.'
+    expect(mapStopReason(assistant({ stopReason: 'error', errorMessage })))
+      .toMatchObject({ kind: 'error', failure: { code: 'QUOTA' } })
+  })
+
+  it('classifies a RESOURCE_EXHAUSTED quota as RATE_LIMIT even when its retryDelay is unparseable', () => {
+    const errorMessage = 'quota exceeded status: RESOURCE_EXHAUSTED "retryDelay": "10m"'
+    expect(mapStopReason(assistant({ stopReason: 'error', errorMessage }))).toEqual({
+      kind: 'error',
+      failure: { message: errorMessage, code: 'RATE_LIMIT' },
+    })
+  })
+
+  it('omits a zero, non-finite, or non-duration retryDelay from the failure', () => {
+    for (const duration of ['0s', `${'9'.repeat(400)}s`, '10m']) {
+      const errorMessage = `Insufficient quota "retryDelay": "${duration}"`
+      expect(mapStopReason(assistant({ stopReason: 'error', errorMessage }))).toEqual({
+        kind: 'error',
+        failure: { message: errorMessage, code: 'QUOTA' },
+      })
+    }
+  })
+
+  it('omits a zero or non-finite "retry in Ns" delay from the failure', () => {
+    for (const value of ['0', '9'.repeat(400)]) {
+      const errorMessage = `HTTP 429 rate limit: Please retry in ${value}s.`
+      expect(mapStopReason(assistant({ stopReason: 'error', errorMessage }))).toEqual({
+        kind: 'error',
+        failure: { message: errorMessage, code: 'RATE_LIMIT' },
+      })
+    }
+  })
+
   it.each([
     'other side closed',
     'HTTP2 request did not get a response',

@@ -39,9 +39,62 @@ export function mapUsage(usage: PiUsage): TokenUsage {
 // wrapper a bare `terminated`, so we are left pattern-matching terse words here.
 // If pi-ai ever forwards the original Error (or a fetch/dispatcher hook that lets
 // us capture the cause ourselves), classify on `code`/`cause` instead of text.
+
+/**
+ * Parse a protobuf Duration string of whole or fractional seconds (e.g. `10s`
+ * or `1.5s`) to seconds. Google's `RetryInfo.retryDelay` emits whole seconds
+ * for rate-limit delays; the fractional form is accepted for forward
+ * compatibility.
+ * @param value - the raw Duration field value (the quoted string in the JSON body).
+ * @returns seconds, or `undefined` when the value is not a positive second count.
+ */
+function parseDurationSeconds(value: string): number | undefined {
+  const match = /^(\d+(?:\.\d+)?)s$/.exec(value)
+  if (match === null) return undefined
+  const seconds = Number(match[1])
+  return Number.isFinite(seconds) && seconds > 0 ? seconds : undefined
+}
+
+/**
+ * Extract the provider's retry-after hint from a flattened pi-ai error string.
+ * Providers surface it as Google's RPC `RetryInfo` detail (`"retryDelay": "10s"`,
+ * a protobuf Duration of seconds) or as the human `Please retry in 10.7s` /
+ * `retry after 5s` wording.
+ * @param message - the flattened error text (pi-ai keeps the provider body verbatim).
+ * @returns the delay in milliseconds, or `undefined` when no positive delay is named.
+ */
+function providerRetryAfterMs(message: string): number | undefined {
+  const retryDelayValue = /"retryDelay"\s*:\s*"([^"]+)"/i.exec(message)?.[1]
+  if (retryDelayValue !== undefined) {
+    const seconds = parseDurationSeconds(retryDelayValue)
+    if (seconds !== undefined) return Math.round(seconds * 1000)
+  }
+  const retryInValue = /\bretry\s+(?:in|after)\s+(\d+(?:\.\d+)?)\s*(?:s|seconds?)\b/i.exec(message)?.[1]
+  if (retryInValue !== undefined) {
+    const seconds = Number(retryInValue)
+    if (Number.isFinite(seconds) && seconds > 0) return Math.round(seconds * 1000)
+  }
+  return undefined
+}
+
+/**
+ * True when a flattened provider error names a transient retry: a parseable
+ * retry delay, or Google's `RESOURCE_EXHAUSTED` status, which always pairs with
+ * a `RetryInfo` detail and denotes a per-minute quota rather than the terminal
+ * account-quota or balance exhaustion the `QUOTA` code reserves.
+ */
+function hasTransientRetryHint(message: string): boolean {
+  return providerRetryAfterMs(message) !== undefined || /\bRESOURCE_EXHAUSTED\b/i.test(message)
+}
+
 function classifyPiAiError(message: string): string {
   if (/\b(?:401|403)\b/.test(message)) return 'AUTH'
-  if (isQuotaExceededError(message)) return QUOTA_EXCEEDED_CODE
+  if (isQuotaExceededError(message)) {
+    // A quota message that also names a retry delay is a transient per-minute
+    // rate limit (Gemini's RESOURCE_EXHAUSTED with a RetryInfo detail), not the
+    // terminal account-quota or balance exhaustion the QUOTA code reserves.
+    return hasTransientRetryHint(message) ? 'RATE_LIMIT' : QUOTA_EXCEEDED_CODE
+  }
   if (/\b429\b|rate.?limit/i.test(message)) return 'RATE_LIMIT'
   // A rejected request body (gateway or provider size cap): resending the
   // same request cannot succeed, so it is invalid, not transient.
@@ -75,7 +128,11 @@ function classifyPiAiError(message: string): string {
  *   `contextWindow`, and zero-output `length` usage that fills the window map
  *   to `CONTEXT_WINDOW_EXCEEDED`; a `stop` with no content blocks maps to an
  *   `EMPTY_RESPONSE` error, while terminal `pending` and `deferred` states map
- *   to non-retryable `PI_AI_ERROR` failures.
+ *   to non-retryable `PI_AI_ERROR` failures. An error failure carries the
+ *   provider-named retry delay as `providerRetryAfterMs` when present, and a
+ *   quota error that names a retry delay (Gemini's per-minute
+ *   `RESOURCE_EXHAUSTED`) classifies as transient `RATE_LIMIT` rather than
+ *   terminal `QUOTA`.
  */
 export function mapStopReason(message: AssistantMessage, contextWindow?: number): FinishReason {
   const piAiOverflow = isContextOverflow(message, contextWindow)
@@ -122,7 +179,15 @@ export function mapStopReason(message: AssistantMessage, contextWindow?: number)
     }
     case 'error': {
       const text = message.errorMessage ?? 'pi-ai stream error'
-      return { kind: 'error', failure: { message: text, code: classifyPiAiError(text) } }
+      const retryAfterMs = providerRetryAfterMs(text)
+      return {
+        kind: 'error',
+        failure: {
+          message: text,
+          code: classifyPiAiError(text),
+          ...retryAfterMs === undefined ? {} : { providerRetryAfterMs: retryAfterMs },
+        },
+      }
     }
   }
 }
