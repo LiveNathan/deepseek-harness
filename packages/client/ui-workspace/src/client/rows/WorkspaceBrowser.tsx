@@ -38,16 +38,25 @@ const SEARCH_DEBOUNCE_MS = 250
 /** `session.search` wire bound, measured in JavaScript UTF-16 code units. */
 const SEARCH_QUERY_MAX_CODE_UNITS = 500
 /** Session rows visible per Workspace before the local overflow control. */
-const COLLAPSED_SESSION_LIMIT = 5
+const COLLAPSED_SESSION_LIMIT = 10
 
-/** Fold one Workspace without charging its provisional New Session against the ordinary-row limit. */
+/**
+ * A Session at work or awaiting the user is never folded behind the overflow
+ * control: work in flight and a waiting approval stay visible regardless of how
+ * many preview rows the Workspace has already spent.
+ */
+function sessionIsActive(session: SessionNode): boolean {
+  return session.running || session.runningSubagentCount > 0 || session.pendingInteraction !== undefined
+}
+
+/** Fold one Workspace without charging its provisional New Session or an active Session against the ordinary-row limit. */
 function collapsedSessionRows(sessions: readonly SessionNode[]): {
   rows: readonly SessionNode[]
   hiddenCount: number
 } {
   let ordinaryCount = 0
   const rows = sessions.filter((session) => {
-    if (session.blank) return true
+    if (session.blank || sessionIsActive(session)) return true
     if (ordinaryCount >= COLLAPSED_SESSION_LIMIT) return false
     ordinaryCount += 1
     return true

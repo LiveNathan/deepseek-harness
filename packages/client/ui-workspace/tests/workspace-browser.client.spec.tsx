@@ -6,7 +6,7 @@ import type { SessionListState, SessionSummary } from '@deepseek-ai/dsh-api-sess
 import type {
   WorkspaceId, WorkspaceSnapshot, WorkspaceView,
 } from '@deepseek-ai/dsh-api-workspace-controller/client'
-import type { SessionPendingInteractionSnapshot } from '@deepseek-ai/dsh-client-ui-session/client'
+import type { SessionPendingInteraction, SessionPendingInteractionSnapshot } from '@deepseek-ai/dsh-client-ui-session/client'
 import type { SessionId } from '@deepseek-ai/dsh-session/types'
 import { zh as commonZh } from '@deepseek-ai/dsh-client-locale/src/locales/zh.ts'
 import type { WorkspaceBrowserProps } from '../src/client/contract/slots.ts'
@@ -45,6 +45,14 @@ const workspaceState = (
   archivedSessionIds: readonly SessionId[] = [],
 ): WorkspaceSnapshot => ({ items, archivedSessionIds, state: 'idle', phase: 'ready', error: null })
 const noPendingInteraction: SessionPendingInteractionSnapshot = new Map()
+/**
+ * The snapshot's value type is the declaration-merged PendingApproval |
+ * PendingQuestion class union, private fields included; the browser reads only
+ * `kind`, so the fixture crosses that type boundary here rather than constructing
+ * a transport value no Workspace row inspects.
+ */
+const pendingApprovalOf = (sessionId: SessionId): SessionPendingInteraction =>
+  ({ key: 'approval-1', kind: 'approval', sessionId }) as unknown as SessionPendingInteraction
 function hook<T>(snapshot: T) {
   return function select<S>(selector: (state: T) => S): S { return selector(snapshot) }
 }
@@ -250,58 +258,92 @@ describe('WorkspaceBrowser', () => {
     expect(screen.queryByText('alpha-s')).toBeNull()
   })
 
-  it('shows five sessions by default and clears transient show-all when the Workspace collapses', () => {
-    const items = Array.from({ length: 7 }, (_, index) => summary(`session-${index + 1}`, 7 - index))
+  it('shows ten sessions by default and clears transient show-all when the Workspace collapses', () => {
+    const items = Array.from({ length: 12 }, (_, index) => summary(`session-${index + 1}`, 12 - index))
     const b = mount({
       useSessions: hook(sessionState(items)),
       useWorkspaces: hook(workspaceState([workspace('alpha', items.map(item => item.id))])),
     })
     fireEvent.click(screen.getByText('alpha'))
-    for (const item of items.slice(0, 5)) expect(screen.getByText(item.displayTitle)).toBeTruthy()
-    expect(screen.queryByText('session-6')).toBeNull()
-    expect(screen.queryByText('session-7')).toBeNull()
+    for (const item of items.slice(0, 10)) expect(screen.getByText(item.displayTitle)).toBeTruthy()
+    expect(screen.queryByText('session-11')).toBeNull()
+    expect(screen.queryByText('session-12')).toBeNull()
 
     fireEvent.click(screen.getByRole('button', { name: '展开其余 2 个会话' }))
-    expect(screen.getByText('session-6')).toBeTruthy()
-    expect(screen.getByText('session-7')).toBeTruthy()
+    expect(screen.getByText('session-11')).toBeTruthy()
+    expect(screen.getByText('session-12')).toBeTruthy()
     expect(screen.getByRole('button', { name: '收起' })).toBeTruthy()
 
     fireEvent.click(screen.getByText('alpha'))
     expect(b.store.getSnapshot().groupExpansion).toEqual({ alpha: false })
     fireEvent.click(screen.getByText('alpha'))
     expect(b.store.getSnapshot().groupExpansion).toEqual({ alpha: true })
-    expect(screen.queryByText('session-6')).toBeNull()
+    expect(screen.queryByText('session-11')).toBeNull()
     expect(screen.getByRole('button', { name: '展开其余 2 个会话' })).toBeTruthy()
   })
 
-  it('keeps the blank New Session outside the five-row folding quota', () => {
-    const ordinary = Array.from({ length: 6 }, (_, index) => summary(`session-${index + 1}`, 6 - index))
-    const blank = summary('blank', 7, { blank: true })
+  it('never folds an active Session behind the overflow control', () => {
+    // Eleven idle Sessions spend the whole preview; the running Session is the
+    // oldest, so only the attention rule can keep it on screen.
+    const idle = Array.from({ length: 11 }, (_, index) => summary(`session-${index + 1}`, 12 - index))
+    const running = summary('session-12', 1, { running: true })
+    const items = [...idle, running]
+    mount({
+      useSessions: hook(sessionState(items)),
+      useWorkspaces: hook(workspaceState([workspace('alpha', items.map(item => item.id))])),
+    })
+    fireEvent.click(screen.getByText('alpha'))
+    for (const item of idle.slice(0, 10)) expect(screen.getByText(item.displayTitle)).toBeTruthy()
+    expect(screen.queryByText('session-11')).toBeNull()
+    expect(screen.getByText('session-12')).toBeTruthy()
+    expect(screen.getByRole('button', { name: '展开其余 1 个会话' })).toBeTruthy()
+  })
+
+  it('never folds a Session awaiting the user behind the overflow control', () => {
+    const idle = Array.from({ length: 11 }, (_, index) => summary(`session-${index + 1}`, 12 - index))
+    const waiting = summary('waiting', 1)
+    const items = [...idle, waiting]
+    mount({
+      useSessions: hook(sessionState(items)),
+      useWorkspaces: hook(workspaceState([workspace('alpha', items.map(item => item.id))])),
+      useSessionPendingInteraction: hook(new Map([
+        [sid('waiting'), pendingApprovalOf(sid('waiting'))],
+      ])),
+    })
+    fireEvent.click(screen.getByText('alpha'))
+    expect(screen.queryByText('session-11')).toBeNull()
+    expect(screen.getByText('waiting')).toBeTruthy()
+    expect(screen.getByRole('button', { name: '展开其余 1 个会话' })).toBeTruthy()
+  })
+
+  it('keeps the blank New Session outside the ten-row folding quota', () => {
+    const ordinary = Array.from({ length: 12 }, (_, index) => summary(`session-${index + 1}`, 12 - index))
+    const blank = summary('blank', 13, { blank: true })
     const b = mount({
       useSessions: hook(sessionState([blank, ...ordinary], { current: blank.id })),
       useWorkspaces: hook(workspaceState([workspace('alpha', [blank.id, ...ordinary.map(item => item.id)])])),
     })
     expect(screen.getByText('新会话')).toBeTruthy()
-    for (const item of ordinary.slice(0, 5)) expect(screen.getByText(item.displayTitle)).toBeTruthy()
-    expect(screen.queryByText('session-6')).toBeNull()
-    expect(screen.getByRole('button', { name: '展开其余 1 个会话' })).toBeTruthy()
+    for (const item of ordinary.slice(0, 10)) expect(screen.getByText(item.displayTitle)).toBeTruthy()
+    expect(screen.queryByText('session-11')).toBeNull()
+    expect(screen.getByRole('button', { name: '展开其余 2 个会话' })).toBeTruthy()
 
-    fireEvent.click(screen.getByRole('button', { name: '展开其余 1 个会话' }))
-    expect(screen.getByText('session-6')).toBeTruthy()
+    fireEvent.click(screen.getByRole('button', { name: '展开其余 2 个会话' }))
+    expect(screen.getByText('session-11')).toBeTruthy()
     fireEvent.click(screen.getByRole('button', { name: '收起' }))
-    expect(screen.queryByText('session-6')).toBeNull()
+    expect(screen.queryByText('session-11')).toBeNull()
 
     rerender(b, {
       useSessions: hook(sessionState([{ ...blank, blank: false }, ...ordinary], { current: blank.id })),
     })
     expect(screen.getByText('blank')).toBeTruthy()
-    expect(screen.queryByText('session-5')).toBeNull()
-    expect(screen.getByRole('button', { name: '展开其余 2 个会话' })).toBeTruthy()
+    expect(screen.queryByText('session-10')).toBeNull()
+    expect(screen.getByRole('button', { name: '展开其余 3 个会话' })).toBeTruthy()
   })
 
   it('anchors collapsed drags before hidden rows so the source stays visible', async () => {
-    const ordinary = Array.from({ length: 6 }, (_, index) => summary(`session-${index + 1}`, 6 - index))
-    const blank = summary('blank', 7, { blank: true })
+    const ordinary = Array.from({ length: 12 }, (_, index) => summary(`session-${index + 1}`, 12 - index))
+    const blank = summary('blank', 13, { blank: true })
     const insertSessionBefore = vi.fn(async () => {})
     const b = mount({
       useSessions: hook(sessionState([blank, ...ordinary], { current: blank.id })),
@@ -310,20 +352,20 @@ describe('WorkspaceBrowser', () => {
     })
     await waitFor(() => {
       expect(b.store.getSnapshot().sessionOrderByAccount.alpha)
-        .toEqual(['blank', 'session-1', 'session-2', 'session-3', 'session-4', 'session-5', 'session-6'])
+        .toEqual(['blank', ...Array.from({ length: 12 }, (_, index) => `session-${index + 1}`)])
     })
 
-    fireEvent.click(screen.getByRole('button', { name: '展开其余 1 个会话' }))
+    fireEvent.click(screen.getByRole('button', { name: '展开其余 2 个会话' }))
     const blankRow = screen.getByText('新会话').closest('[role="treeitem"]') as HTMLElement
-    const session6 = screen.getByText('session-6').closest('[role="treeitem"]') as HTMLElement
-    session6.getBoundingClientRect = () => ({
+    const session12 = screen.getByText('session-12').closest('[role="treeitem"]') as HTMLElement
+    session12.getBoundingClientRect = () => ({
       top: 200, bottom: 234, left: 0, right: 200, width: 200, height: 34,
       x: 0, y: 200, toJSON: () => ({}),
     })
     fireEvent.dragStart(blankRow, { dataTransfer: dragData() })
-    fireDrag(session6, 'drop', 230)
+    fireDrag(session12, 'drop', 230)
     expect(b.store.getSnapshot().sessionOrderByAccount.alpha)
-      .toEqual(['session-1', 'session-2', 'session-3', 'session-4', 'session-5', 'session-6', 'blank'])
+      .toEqual([...Array.from({ length: 12 }, (_, index) => `session-${index + 1}`), 'blank'])
 
     insertSessionBefore.mockClear()
     fireEvent.click(screen.getByRole('button', { name: '收起' }))
@@ -332,19 +374,24 @@ describe('WorkspaceBrowser', () => {
       top: 200, bottom: 234, left: 0, right: 200, width: 200, height: 34,
       x: 0, y: 200, toJSON: () => ({}),
     })
-    const session5 = screen.getByText('session-5').closest('[role="treeitem"]') as HTMLElement
-    fireEvent.dragStart(session5, { dataTransfer: dragData() })
+    // The last preview row cannot move onto the blank row: the drop would push it
+    // past the preview and hide the very row being dragged.
+    const session10 = screen.getByText('session-10').closest('[role="treeitem"]') as HTMLElement
+    fireEvent.dragStart(session10, { dataTransfer: dragData() })
     fireDrag(collapsedBlank, 'drop', 205)
     expect(insertSessionBefore).not.toHaveBeenCalled()
 
-    const session4 = screen.getByText('session-4').closest('[role="treeitem"]') as HTMLElement
-    fireEvent.dragStart(session4, { dataTransfer: dragData() })
+    const session9 = screen.getByText('session-9').closest('[role="treeitem"]') as HTMLElement
+    fireEvent.dragStart(session9, { dataTransfer: dragData() })
     fireDrag(collapsedBlank, 'drop', 205)
     expect(b.store.getSnapshot().sessionOrderByAccount.alpha)
-      .toEqual(['session-1', 'session-2', 'session-3', 'session-5', 'session-4', 'session-6', 'blank'])
-    expect(insertSessionBefore).toHaveBeenCalledWith(wid('alpha'), sid('session-4'), sid('session-6'))
-    expect(screen.getByText('session-4')).toBeTruthy()
-    expect(screen.queryByText('session-6')).toBeNull()
+      .toEqual([
+        ...Array.from({ length: 8 }, (_, index) => `session-${index + 1}`),
+        'session-10', 'session-9', 'session-11', 'session-12', 'blank',
+      ])
+    expect(insertSessionBefore).toHaveBeenCalledWith(wid('alpha'), sid('session-9'), sid('session-11'))
+    expect(screen.getByText('session-9')).toBeTruthy()
+    expect(screen.queryByText('session-11')).toBeNull()
   })
 
   it('shares one editable order across modes and promotes only while Last updated is active', async () => {
