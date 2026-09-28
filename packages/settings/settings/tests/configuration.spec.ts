@@ -1,5 +1,6 @@
 /** Real profile patch behavior and reference lifetime. */
-import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { expect, it, vi } from 'vitest'
 import { parse } from 'yaml'
@@ -312,31 +313,53 @@ it('registers optional presentation policy after Settings loads and removes it w
   await vi.waitFor(() => { expect(ctx.settings.describe().find(view => view.ns === 'first')!.autoGenerate).toBe(false) })
 })
 
-it('imports the removed settings.yaml into the profile once and keeps rejected sections in the renamed file', async () => {
+it('imports the shared settings.yaml once per profile without consuming it', async () => {
   const { ctx, home, profile, start } = await fixture()
   await ctx.fiber.dispose()
   const legacy = join(home, 'settings.yaml')
+  const marker = join(profile.dir, 'settings.yaml.imported')
   writeFileSync(legacy, 'default-model:\n  model: legacy\nfirst:\n  ordinary: rejected\nmissing:\n  count: 1\n')
   const restored = await start()
   await vi.waitFor(() => { expect(restored.agentDefaultModel.currentSelection().model).toBe('legacy') })
   expect(parse(readFileSync(profile.patchPath, 'utf8'))).toContainEqual({ id: 'default-model', name: 'cordis:model', config: { provider: 'test', model: 'legacy' } })
   expect(restored.settings.describe({ redactSecrets: true }).find(row => row.ns === 'first')!.value).toEqual({ count: 2, list: [] })
-  expect(existsSync(legacy)).toBe(false)
-  expect(readFileSync(`${legacy}.imported`, 'utf8')).toContain('rejected')
-  // An empty document is renamed without writes; a document that cannot be renamed is reported, not rethrown into boot.
+  // The shared document stays in place with the rejected section; the profile records completion beside its patch.
+  expect(existsSync(legacy)).toBe(true)
+  expect(readFileSync(legacy, 'utf8')).toContain('rejected')
+  expect(existsSync(marker)).toBe(true)
+  // A marker beside the profile suppresses re-import on the next boot.
   await restored.fiber.dispose()
-  writeFileSync(legacy, '')
+  writeFileSync(legacy, 'default-model:\n  model: second-boot\n')
   const again = await start()
-  await vi.waitFor(() => { expect(readFileSync(`${legacy}.imported`, 'utf8')).toBe('') })
+  await vi.waitFor(() => { expect(again.settings.describe().length).toBeGreaterThan(0) })
+  expect(again.agentDefaultModel.currentSelection().model).toBe('legacy')
+  expect(readFileSync(profile.patchPath, 'utf8')).not.toContain('second-boot')
+  // An empty document marks completion without importing anything.
   await again.fiber.dispose()
-  writeFileSync(legacy, 'default-model:\n  model: blocked\n')
-  rmSync(`${legacy}.imported`)
-  mkdirSync(join(home, 'settings.yaml.imported', 'occupied'), { recursive: true })
+  rmSync(marker)
+  writeFileSync(legacy, '')
+  const empty = await start()
+  await vi.waitFor(() => { expect(existsSync(marker)).toBe(true) })
+  // A document the parser rejects is reported, not rethrown into boot.
+  await empty.fiber.dispose()
+  rmSync(marker)
+  writeFileSync(legacy, ': not a mapping\n[unclosed\n')
   const blocked = await start()
   const failures = (): unknown[] => blocked.logger.buffer.filter(message => message.type === 'error').map((message): unknown => message.args[0])
-  // The rename fails with EISDIR on POSIX and EPERM on Windows; the reported error names the rename either way.
-  await vi.waitFor(() => { expect(failures().some(failure => failure instanceof Error && failure.message.includes('rename'))).toBe(true) })
+  await vi.waitFor(() => { expect(failures().some(failure => failure instanceof Error)).toBe(true) })
   expect(blocked.agentDefaultModel.currentSelection().model).toBe('legacy')
+})
+
+it('imports the shared settings.yaml into every profile', async () => {
+  const home = realpathSync(mkdtempSync(join(tmpdir(), 'settings-shared-')))
+  writeFileSync(join(home, 'settings.yaml'), 'default-model:\n  model: shared\n')
+  const first = await fixture({ home, profileName: 'first' })
+  await vi.waitFor(() => { expect(first.ctx.agentDefaultModel.currentSelection().model).toBe('shared') })
+  await first.ctx.fiber.dispose()
+  expect(existsSync(join(home, 'settings.yaml'))).toBe(true)
+  const second = await fixture({ home, profileName: 'second' })
+  await vi.waitFor(() => { expect(second.ctx.agentDefaultModel.currentSelection().model).toBe('shared') })
+  expect(parse(readFileSync(second.profile.patchPath, 'utf8'))).toContainEqual({ id: 'default-model', name: 'cordis:model', config: { provider: 'test', model: 'shared' } })
 })
 
 it('describes an entry whose required field only the profile supplies, and reports a failed refresh instead of crashing', async () => {

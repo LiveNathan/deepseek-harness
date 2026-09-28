@@ -1,6 +1,6 @@
 /** Config-schema projection and form edits over Cordis profile patches. */
 import { existsSync } from 'node:fs'
-import { readFile, rename } from 'node:fs/promises'
+import { readFile, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { parse } from 'yaml'
 import { Context, FiberState, Service, resolveConfig, type Fiber } from '@deepseek-ai/cordis'
@@ -201,6 +201,7 @@ function member(node: unknown, key: string, own = false): unknown {
 const LEGACY_SECTION_ENTRIES: Record<string, string> = {
   'ui-developer-tools': 'ui-settings',
   'ui-onboarding': 'ui-settings-general',
+  'subagent-model-selection': 'subagent-model-selection-settings',
   /* v8 ignore next -- the base bundle composes one shell executor per platform */
   shell: process.platform === 'win32' ? 'pwsh-sandbox' : 'bash-sandbox',
 }
@@ -236,25 +237,28 @@ export class SettingsForms extends Service {
   }
 
   /** Move the sections of the removed `settings.yaml` into the active profile once the Loader has settled every entry.
-   * The document is renamed before the first write, so a partial import never repeats; a section the running
-   * composition rejects is logged and remains only in the renamed file. */
+   * `$DSH_HOME/settings.yaml` is one document shared by every profile, so the import leaves it in place and records
+   * completion in `<profile dir>/settings.yaml.imported`. Renaming the shared document let the first profile to boot
+   * claim every section and permanently starve the others. A section the running composition rejects is logged and
+   * remains in the source document. */
   private async importLegacyDocument(): Promise<void> {
     const profile = this.ownerContext.profileContext
     const path = join(profile.home, 'settings.yaml')
     if (!existsSync(path)) return
-    const imported = `${path}.imported`
-    await rename(path, imported)
-    const sections = parse(await readFile(imported, 'utf8')) as Record<string, object> | null
+    const marker = join(profile.dir, 'settings.yaml.imported')
+    if (existsSync(marker)) return
+    await writeFile(marker, '', { mode: 0o600 })
+    const sections = parse(await readFile(path, 'utf8')) as Record<string, object> | null
     for (const [section, values] of Object.entries(sections ?? {})) {
       const ns = LEGACY_SECTION_ENTRIES[section] ?? section
       try {
         await this.update(ns, values)
       } catch (error) {
-        this.ownerContext.logger.warn('settings: section %s of %s was not imported into entry %s', section, imported, ns)
+        this.ownerContext.logger.warn('settings: section %s of %s was not imported into entry %s', section, path, ns)
         this.ownerContext.logger.warn(error)
       }
     }
-    this.ownerContext.logger.info('settings: imported %s into profile %s', imported, profile.name)
+    this.ownerContext.logger.info('settings: imported %s into profile %s', path, profile.name)
   }
 
   /** Register the calling plugin instance's page policy without changing its Config.
