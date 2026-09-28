@@ -38,7 +38,7 @@ Use [settings](../../settings/settings/README.md) for forms restricted to live f
 <details>
 <summary>Implementation internals — click to expand</summary>
 
-The [editor](src/index.ts) reconciles external changes before deriving a candidate, locks the profile manifest alongside other profile operations, and atomically replaces its config override. It preserves YAML comments and `!!js` expressions outside replaced values. A failed reconciliation restores the prior document and reloads the prior patches.
+The [editor](src/index.ts) reconciles external changes before deriving a candidate, locks the profile manifest alongside other profile operations, and atomically replaces its config override; a symlinked patch is resolved first so the referent is replaced and the link survives. It preserves YAML comments and `!!js` expressions outside replaced values. A failed reconciliation restores the prior document and reloads the prior patches.
 
 No invariant companion is published: the editor keeps no independent configuration projection. Loader and the persisted profile patch own configuration state.
 

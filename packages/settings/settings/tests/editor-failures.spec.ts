@@ -1,6 +1,6 @@
 /** File failures between validation and commit must not persist partial edits. */
 import * as fs from 'node:fs/promises'
-import { readFileSync } from 'node:fs'
+import { readFileSync, rmSync } from 'node:fs'
 import { afterEach, expect, it, vi } from 'vitest'
 import { configurationFixture } from './configuration-fixture.ts'
 
@@ -28,7 +28,7 @@ it.each([
 it('creates a patch removed between validation and reading the document', async () => {
   const { ctx, profile } = await configurationFixture({ hmr: false })
   const entry = ctx.configEditor.entries().find(row => row.options.id === 'first')!
-  vi.mocked(fs.readFile).mockRejectedValueOnce(Object.assign(new Error('removed'), { code: 'ENOENT' }))
+  rmSync(profile.patchPath)
   await ctx.configEditor.edit(entry, raw => ({ ...raw, count: 6 }))
   expect(readFileSync(profile.patchPath, 'utf8')).toContain('count: 6')
 })
