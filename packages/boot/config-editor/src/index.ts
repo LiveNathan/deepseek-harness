@@ -1,5 +1,5 @@
 /** Profile-owned configuration edits, serialized with Loader hot reload. */
-import { readFile } from 'node:fs/promises'
+import { readFile, realpath } from 'node:fs/promises'
 import { join } from 'node:path'
 import { isDeepStrictEqual } from 'node:util'
 import { Context, FiberState, Service, resolveConfig } from '@deepseek-ai/cordis'
@@ -102,8 +102,13 @@ export class ConfigEditor extends Service {
         if (fiber.state !== FiberState.ACTIVE) throw new Error('Configuration plugin is no longer active')
         const resolved: unknown = fiber.ctx.waterfall(fiber, 'internal/config', next, () => next)
         resolveConfig(fiber.runtime as NonNullable<typeof fiber.runtime>, resolved)
+        // The profile patch is often a symlink to a source-of-truth file. Write
+        // through the referent: `writeFileAtomic` replaces the named directory
+        // entry, which would re-materialise the symlink as a regular copy and
+        // orphan its dsh-MCP consumer and the Loader watcher.
+        const target = await realpath(path).catch(() => path)
         let before: string
-        try { before = await readFile(path, 'utf8') }
+        try { before = await readFile(target, 'utf8') }
         catch (error) {
           if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
           before = '[]\n'
@@ -139,11 +144,11 @@ export class ConfigEditor extends Service {
         if (!isDeepStrictEqual(effective?.config ?? {}, next)) {
           throw new Error(`Configuration for "${entry.options.id}" is overridden by a home patch or command-line overlay`)
         }
-        await writeFileAtomic(path, String(document), { mode: 0o600 })
+        await writeFileAtomic(target, String(document), { mode: 0o600 })
         try {
           await reconcileProfilePatches(this.ownerContext.root, patches, 'dsh', [entry.options.id])
         } catch (error) {
-          await writeFileAtomic(path, before, { mode: 0o600 })
+          await writeFileAtomic(target, before, { mode: 0o600 })
           await reconcileProfilePatches(this.ownerContext.root, beforePatches, 'dsh')
           throw error
         }
