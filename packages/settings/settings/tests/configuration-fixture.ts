@@ -12,9 +12,19 @@ import Hmr from '@deepseek-ai/dsh-hmr'
 import DefaultModel from '@deepseek-ai/dsh-agent-default-model'
 import Settings from '../src/index.ts'
 
-export async function configurationFixture(options: { schema?: z; apply?: (ctx: Context, config: unknown) => void; hmr?: boolean } = {}) {
-  const home = realpathSync(mkdtempSync(join(tmpdir(), 'settings-config-')))
-  const dir = join(home, 'profiles', 'test')
+export async function configurationFixture(options: {
+  schema?: z
+  apply?: (ctx: Context, config: unknown) => void
+  hmr?: boolean
+  /** Reuse an installation home so two profiles import the same machine-wide document. */
+  home?: string
+  /** Profile directory name under `profiles/`; defaults to `test`. */
+  profileName?: string
+  /** Extra bundle rows mounted beside the fixed probe entries. */
+  entries?: ReadonlyArray<Record<string, unknown>>
+} = {}) {
+  const home = options.home ?? realpathSync(mkdtempSync(join(tmpdir(), 'settings-config-')))
+  const dir = join(home, 'profiles', options.profileName ?? 'test')
   onTestFinished(() => { rmSync(home, { recursive: true, force: true }) })
   initProfile(dir, ['test-bundle'])
   const bundle = join(dir, 'node_modules', 'test-bundle')
@@ -27,6 +37,7 @@ export async function configurationFixture(options: { schema?: z; apply?: (ctx: 
     { id: 'default-model', name: 'cordis:model', config: { provider: 'test', model: 'original' } },
     { id: 'first', name: 'cordis:probe', config: { ordinary: 'fixed', token: 'private' } },
     { id: 'second', name: 'cordis:probe', config: { ordinary: 'second' } },
+    ...options.entries ?? [],
   ] }]))
   writeFileSync(join(dir, 'cordis.yml'), '[]\n')
   const profile: ProfileContext = {
@@ -37,12 +48,16 @@ export async function configurationFixture(options: { schema?: z; apply?: (ctx: 
     Config: options.schema ?? z.object({ ordinary: z.string().required(), count: z.number().min(1).default(2).volatile(), token: z.string().role('secret').volatile(), list: z.array(z.object({ name: z.string().required(), token: z.string().role('secret') })).volatile() }),
     apply: options.apply ?? (() => {}),
   }
+  const Selection = {
+    Config: z.object({ enabled: z.boolean().default(false).volatile() }),
+    apply: (): void => {},
+  }
   const start = async (): Promise<Context> => {
     const ctx = await boot('test', join(dir, 'cordis.yml'), readProfilePatches('test', profile), (ctx) => {
       ctx.provide('profileContext', profile)
       ctx.provide('appReady', { onReady: (listener: () => void) => { listener(); return () => {} } })
       Object.assign(ctx.loader.builtins, {
-        editor: ConfigEditor, settings: Settings, model: DefaultModel, probe: Probe,
+        editor: ConfigEditor, settings: Settings, model: DefaultModel, probe: Probe, selection: Selection,
       })
     })
     onTestFinished(async () => { await ctx.fiber.dispose() })
