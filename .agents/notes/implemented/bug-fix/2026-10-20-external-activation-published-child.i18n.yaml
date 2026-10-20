@@ -1,0 +1,22 @@
+# Bilingual-pair consistency record for 2026-10-20-external-activation-published-child.md (docs/i18n/README.md): per heading
+# section, a hash of its English and Chinese blocks outside code blocks and generated regions.
+# After editing either side, bring the other along and re-record with:
+#   pnpm run verify-translation-pairing --write .agents/notes/implemented/bug-fix/2026-10-20-external-activation-published-child.md
+/agent-note-external-activation-may-publish-its-own-child:
+  en: f9ed62ab0073a2b4
+  zh: 29c4dbd87800398c
+/agent-note-external-activation-may-publish-its-own-child/problem:
+  en: 2c11b5d81f96b288
+  zh: b07bf565fc69c4ea
+/agent-note-external-activation-may-publish-its-own-child/decision:
+  en: 445354283a0e0ac5
+  zh: 925136d75cc10f0f
+/agent-note-external-activation-may-publish-its-own-child/alternatives-considered:
+  en: d569975bb9323b41
+  zh: ec1b0a0d384085f5
+/agent-note-external-activation-may-publish-its-own-child/consequences:
+  en: 2429548ec36eb26f
+  zh: d9d3ba8e0710aa35
+/agent-note-external-activation-may-publish-its-own-child/testing:
+  en: 7dd24418d5c42a38
+  zh: df693b6f52492d5e

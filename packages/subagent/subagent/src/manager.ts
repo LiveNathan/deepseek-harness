@@ -629,10 +629,23 @@ export class SubagentManager {
 
   /**
    * Reject one child identity already owned by a live Agent or Session.
+   *
+   * An external backend may publish its own child under the id it returns, so
+   * an Agent or Session parented to that run's parent is the run's child, not
+   * a collision. Any other Agent, Session, or resident activation is.
    * @param childId - proposed durable child session id.
+   * @param publishedBy - the delegating parent when an external start may publish the child.
    */
-  private assertChildIdAvailable(childId: SessionId): void {
-    if (this.resident.has(childId) || this.ctx.agents.get(childId) !== undefined || this.ctx.get('sessions')?.get(childId) !== undefined) {
+  private assertChildIdAvailable(childId: SessionId, publishedBy?: Agent): void {
+    const agent = this.ctx.agents.get(childId)
+    const session = this.ctx.get('sessions')?.get(childId)
+    const publishedChild = (parentSession: SessionId | undefined): boolean =>
+      publishedBy !== undefined && parentSession === publishedBy.id
+    if (
+      this.resident.has(childId)
+      || (agent !== undefined && !publishedChild(agent.session.header.parentSession))
+      || (session !== undefined && !publishedChild(session.header.parentSession))
+    ) {
       throw new SubagentError(`subagent "${childId}" already exists`, 'DUPLICATE_CHILD')
     }
   }
@@ -867,7 +880,7 @@ export class SubagentManager {
         resource = { kind: 'external', run, controller }
         void run.result.catch(() => undefined)
         childId = run.id
-        try { this.assertChildIdAvailable(childId) } catch (error: unknown) {
+        try { this.assertChildIdAvailable(childId, parent) } catch (error: unknown) {
           await run.dispose()
           throw error
         }

@@ -362,6 +362,23 @@ it('records external membership at creation without publishing settlement update
   }
 })
 
+it('accepts an external run whose id names the Session it published', async () => {
+  const backend = execution()
+  backend.cleanup.resolve(undefined)
+  const childId = SessionId('run-owned-session')
+  const fixture = await setup(async () => {
+    const session = fixture.ctx.sessions.create(childId, { meta: { parentSession: fixture.parent.id } })
+    fixture.ctx.agents.register({ ...fixture.parent, id: childId, session })
+    return { ...backend.run, id: childId }
+  })
+  const activation = await fixture.start()
+  expect(activation.childId).toBe(childId)
+  backend.result.resolve(completed)
+  await expect(activation.result).resolves.toEqual(completed)
+  await activation.dispose()
+  expect(fixture.ctx.sessions.get(childId)).toBeDefined()
+})
+
 it('refuses a reserved Session id for an external provider before dispatch', async () => {
   const start = vi.fn()
   const fixture = await setup(start)
